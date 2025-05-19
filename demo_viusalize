@@ -1,0 +1,269 @@
+import gradio as gr
+from ultralytics import YOLO
+import PIL.Image as Image
+import numpy as np
+import cv2
+import torch
+from pytorch_grad_cam import GradCAM
+from pytorch_grad_cam.utils.image import show_cam_on_image
+
+# 设备配置
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# 加载YOLO模型
+model = YOLO("/root/autodl-tmp/ultralytics-main/runs/train/ep-original-bifpn-128/weights/best.pt").to(device)
+
+# 启用梯度计算
+for param in model.model.parameters():
+    param.requires_grad_(True)
+
+# Grad-CAM包装类
+class YOLOWrapper(torch.nn.Module):
+    def __init__(self, model):
+        super().__init__()
+        self.model = model.model
+        self.target_layer = self.model.model[12]
+        self.activations = None
+        self.gradients = None
+        self.target_layer.register_forward_hook(self.save_activations)
+        self.target_layer.register_full_backward_hook(self.save_gradients)
+
+    def save_activations(self, module, input, output):
+        self.activations = output.detach().requires_grad_(True)
+
+    def save_gradients(self, module, grad_input, grad_output):
+        self.gradients = grad_output[0].detach()
+
+    def forward(self, x):
+        output = self.model(x)
+        return output[0] if isinstance(output, tuple) else output
+
+# 初始化Grad-CAM
+target_model = YOLOWrapper(model).to(device)
+cam = GradCAM(model=target_model, target_layers=[target_model.target_layer])
+
+def preprocess_image(img):
+    """固定尺寸预处理"""
+    try:
+        img = np.array(img)
+        img = cv2.resize(img, (640, 640))  # 强制缩放
+        img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+        img = np.float32(img) / 255.0
+        return img
+    except Exception as e:
+        print(f"图像预处理失败: {str(e)}")
+        return None
+
+def generate_heatmap(img_tensor):
+    """生成固定尺寸热力图"""
+    try:
+        img_tensor = img_tensor.to(device).requires_grad_(True)
+        
+        class FeatureMapTarget:
+            def __call__(self, model_output):
+                return torch.sum(model_output)
+        
+        grayscale_cam = cam(input_tensor=img_tensor, targets=[FeatureMapTarget()])
+        grayscale_cam = grayscale_cam[0, :]
+        grayscale_cam = cv2.resize(grayscale_cam, (640, 640))  # 确保输出尺寸
+        grayscale_cam = np.maximum(grayscale_cam, 0)
+        grayscale_cam = (grayscale_cam - grayscale_cam.min()) / (grayscale_cam.max() - grayscale_cam.min() + 1e-8)
+        return grayscale_cam
+    except Exception as e:
+        print(f"热力图生成失败: {str(e)}")
+        return None
+
+def predict_image(img, conf_thresh=0.25, iou_thresh=0.45):
+    """四窗体预测函数"""
+    try:
+        processed_img = preprocess_image(img)
+        if processed_img is None:
+            raise ValueError("图像预处理失败")
+        
+        img_tensor = torch.from_numpy(processed_img.transpose(2, 0, 1)).unsqueeze(0).float()
+        
+        results = model.predict(
+            source=img,
+            conf=conf_thresh,
+            iou=iou_thresh,
+            imgsz=640,
+            device=device.type,
+            verbose=False
+        )
+        
+        if len(results) == 0:
+            raise ValueError("未检测到目标")
+        r = results[0]
+        
+        # 生成检测结果
+        det_img = Image.fromarray(r.plot()[..., ::-1]).resize((640, 640))
+        original_img = img.resize((640, 640)) if img else Image.new('RGB', (640, 640), (128,128,128))
+        
+        # 生成热力图
+        heatmap = generate_heatmap(img_tensor)
+        if heatmap is not None:
+            heatmap_img = show_cam_on_image(processed_img, heatmap, use_rgb=True)
+            heatmap_img = Image.fromarray(heatmap_img).resize((640, 640))
+        else:
+            heatmap_img = Image.new('RGB', (640, 640), (128, 128, 128))
+
+        # 生成特征可视化图（这里假设就是热力图，可根据实际情况修改）
+        feature_visualization_img = heatmap_img
+
+        return [original_img, det_img, heatmap_img, feature_visualization_img]
+    
+    except Exception as e:
+        print(f"预测错误: {str(e)}")
+        error_img = Image.new('RGB', (640, 640), (255, 0, 0))
+        return [error_img, error_img, error_img, error_img]
+
+def clear_outputs():
+    """清空所有输出"""
+    return [None, None, None, None]
+
+# 界面布局
+with gr.Blocks(css="""
+/* 主容器 */
+.main-container {
+    max-width: 100vw !important;
+    padding: 20px !important;
+    background: #f5f7fb !important;
+}
+
+/* 四窗格水平布局 */
+.horizontal-panels {
+    display: flex !important;
+    gap: 20px !important;
+    padding: 15px 0 !important;
+    overflow-x: auto !important;
+}
+
+/* 统一窗体样式 */
+.panel {
+    flex: 0 0 440px !important;
+    height: 480px !important;
+    background: white !important;
+    border-radius: 12px !important;
+    box-shadow: 0 4px 12px rgba(0,0,0,0.08) !important;
+    padding: 15px !important;
+}
+
+/* 图片容器 */
+.image-container {
+    height: 400px !important;
+    border: 2px dashed #e1e4e9 !important;
+    border-radius: 8px !important;
+    background: #f8f9fa !important;
+    margin-bottom: 10px !important;
+}
+.image-container img {
+    object-fit: contain !important;
+}
+
+/* 控制面板 */
+.control-panel {
+    background: white !important;
+    border-radius: 12px !important;
+    padding: 25px 40px !important;
+    margin-top: 25px !important;
+    box-shadow: 0 4px 12px rgba(0,0,0,0.06) !important;
+}
+
+/* 按钮样式 */
+.action-btns {
+    display: flex !important;
+    gap: 15px !important;
+    margin-top: 20px !important;
+}
+.btn-primary {
+    background: #4CAF50 !important;
+    color: white !important;
+    padding: 12px 35px !important;
+    border-radius: 8px !important;
+    transition: all 0.3s !important;
+}
+.btn-primary:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 5px 15px rgba(76,175,80,0.3);
+}
+.btn-secondary {
+    background: #6c757d !important;
+    color: white !important;
+}
+
+/* 统计信息样式 */
+.stats-panel {
+    font-family: monospace !important;
+    padding: 15px !important;
+    background: #f8f9fa !important;
+    border-radius: 8px !important;
+}
+""") as demo:
+    
+    with gr.Column(elem_classes="main-container"):
+        # 标题
+        gr.Markdown("# 🍅 番茄果实检测系统", elem_id="header")
+        
+        # 四窗格水平布局
+        with gr.Row(elem_classes="horizontal-panels"):
+            # 窗体1：原始图像
+            with gr.Column(elem_classes="panel"):
+                gr.Markdown("### 原始图像")
+                original_output = gr.Image(elem_classes="image-container")
+            
+            # 窗体2：检测结果
+            with gr.Column(elem_classes="panel"):
+                gr.Markdown("### 检测结果")
+                det_output = gr.Image(elem_classes="image-container")
+            
+            # 窗体3：热力图
+            with gr.Column(elem_classes="panel"):
+                gr.Markdown("### 热力图分析")
+                heatmap_output = gr.Image(elem_classes="image-container")
+            
+            # 窗体4：特征可视化
+            with gr.Column(elem_classes="panel"):
+                gr.Markdown("### 特征可视化")
+                feature_visualization_output = gr.Image(elem_classes="image-container")
+
+        # 底部控制面板
+        with gr.Column(elem_classes="control-panel"):
+            with gr.Row():
+                # 上传区域
+                input_img = gr.Image(type="pil", label="上传图片", width=300)
+                
+                # 参数控制
+                with gr.Column():
+                    conf_slider = gr.Slider(0, 1, 0.25, label="置信度阈值")
+                    iou_slider = gr.Slider(0, 1, 0.45, label="交并比阈值")
+                    
+                    # 操作按钮
+                    with gr.Row(elem_classes="action-btns"):
+                        submit_btn = gr.Button("开始检测", elem_classes="btn-primary")
+                        clear_btn = gr.Button("清空结果", elem_classes="btn-secondary")
+
+        # 示例
+        gr.Examples(
+            examples=[
+                ["/root/autodl-tmp/ultralytics-main/dataset/images/val/Riped tomato_80.jpeg", 0.25, 0.45],
+                ["/root/autodl-tmp/ultralytics-main/dataset/images/val/Riped tomato_4.jpeg", 0.25, 0.45],
+            ],
+            inputs=[input_img, conf_slider, iou_slider],
+            label="快速示例",
+            examples_per_page=2
+        )
+
+    # 绑定交互事件
+    submit_btn.click(
+        fn=predict_image,
+        inputs=[input_img, conf_slider, iou_slider],
+        outputs=[original_output, det_output, heatmap_output, feature_visualization_output]
+    )
+    
+    clear_btn.click(
+        fn=clear_outputs,
+        outputs=[original_output, det_output, heatmap_output, feature_visualization_output]
+    )
+
+if __name__ == "__main__":
+    demo.launch()    
